@@ -2,6 +2,8 @@ import sys
 import os
 import datetime
 from decimal import Decimal
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 import mysql.connector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -713,9 +715,16 @@ def run_analytics_tests():
 
     # T21: Checkpoint 10 days old (projection starts day after anchor)
     try:
-        cursor.execute("SELECT anchor_date, horizon_start FROM projection_run WHERE run_id = 1")
+        cursor.execute("SELECT anchor_date, horizon_start FROM projection_run ORDER BY run_id DESC LIMIT 1")
         row = cursor.fetchone()
-        if row['horizon_start'] == row['anchor_date'] + datetime.timedelta(days=1):
+        if not row:
+            cur_p = conn.cursor()
+            cur_p.callproc('build_projection', [1, 1, 90, 0])
+            cur_p.close()
+            cursor.execute("SELECT anchor_date, horizon_start FROM projection_run ORDER BY run_id DESC LIMIT 1")
+            row = cursor.fetchone()
+
+        if row and row['horizon_start'] == row['anchor_date'] + datetime.timedelta(days=1):
             print("PASS: T21 Checkpoint anchor (projection starts exactly 1 day after checkpoint date)")
             passed += 1
         else:
@@ -723,6 +732,142 @@ def run_analytics_tests():
             failed += 1
     except Exception as ex:
         print(f"FAIL: T21 Exception: {ex}")
+        failed += 1
+
+    cursor.close()
+    conn.close()
+    return passed, failed
+
+def run_quality_tests():
+    print("\nRunning Phase 7 quality, concurrency, and invariant tests (T13, T14, T27, T28, T32)...")
+    passed = 0
+    failed = 0
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    # T13: Multiple accounts independence test
+    try:
+        cur_proc = conn.cursor()
+        res1 = cur_proc.callproc('build_projection', [1, 1, 365, 0])
+        run1_id = res1[3]
+        res2 = cur_proc.callproc('build_projection', [1, 2, 365, 0])
+        run2_id = res2[3]
+        cur_proc.close()
+
+        cursor.execute("SELECT account_id, min_balance, first_breach_date FROM projection_run WHERE run_id = %s", [run1_id])
+        r1 = cursor.fetchone()
+        cursor.execute("SELECT account_id, min_balance, first_breach_date FROM projection_run WHERE run_id = %s", [run2_id])
+        r2 = cursor.fetchone()
+
+        if (r1['account_id'] == 1 and r1['first_breach_date'] == datetime.date(2026, 10, 18) and
+            r2['account_id'] == 2 and r2['first_breach_date'] is None):
+            print("PASS: T13 Multiple accounts independence (Account 1 breaches 2026-10-18, Account 2 never breaches)")
+            passed += 1
+        else:
+            print(f"FAIL: T13 Results leaked or incorrect: r1={r1}, r2={r2}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T13 Exception: {ex}")
+        failed += 1
+
+    # T14: Concurrent projections and row locking
+    try:
+        import threading
+        results_thread = {}
+
+        def thread_task(thread_id, acc_id):
+            try:
+                t_conn = get_connection()
+                t_cur = t_conn.cursor()
+                res = t_cur.callproc('build_projection', [1, acc_id, 90, 0])
+                results_thread[thread_id] = res[3]
+                t_cur.close()
+                t_conn.close()
+            except Exception as e:
+                results_thread[thread_id] = str(e)
+
+        t1 = threading.Thread(target=thread_task, args=('t1', 1))
+        t2 = threading.Thread(target=thread_task, args=('t2', 2))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        run_t1 = results_thread.get('t1')
+        run_t2 = results_thread.get('t2')
+        if isinstance(run_t1, int) and isinstance(run_t2, int) and run_t1 != run_t2:
+            print(f"PASS: T14 Concurrent builds produce distinct, consistent runs (runs {run_t1} and {run_t2})")
+            passed += 1
+        else:
+            print(f"FAIL: T14 Concurrent execution failed: {results_thread}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T14 Exception: {ex}")
+        failed += 1
+
+    # T27: Invariant: for every run, sum(projection_event.amount) == sum(projection_day.net)
+    try:
+        cursor.execute("""
+            SELECT 
+                pr.run_id,
+                COALESCE((SELECT SUM(amount) FROM projection_event pe WHERE pe.run_id = pr.run_id), 0.00) AS event_sum,
+                COALESCE((SELECT SUM(net) FROM projection_day pd WHERE pd.run_id = pr.run_id), 0.00) AS day_net_sum
+            FROM projection_run pr
+        """)
+        mismatches = [row for row in cursor.fetchall() if row['event_sum'] != row['day_net_sum']]
+        if not mismatches:
+            print("PASS: T27 Invariant holds: sum of projection_event.amount equals sum of projection_day.net for all runs")
+            passed += 1
+        else:
+            print(f"FAIL: T27 Invariant violated for {len(mismatches)} runs: {mismatches[:3]}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T27 Exception: {ex}")
+        failed += 1
+
+    # T28: Invariant: each day's balance equals previous day's balance plus its net
+    try:
+        cursor.execute("""
+            WITH ordered_days AS (
+                SELECT 
+                    run_id,
+                    day,
+                    net,
+                    balance,
+                    LAG(balance, 1) OVER (PARTITION BY run_id ORDER BY day) AS prev_balance
+                FROM projection_day
+            )
+            SELECT * FROM ordered_days 
+            WHERE prev_balance IS NOT NULL AND balance <> (prev_balance + net)
+        """)
+        balance_errors = cursor.fetchall()
+        if not balance_errors:
+            print("PASS: T28 Invariant holds: daily balance equals previous day balance plus net for all days in all runs")
+            passed += 1
+        else:
+            print(f"FAIL: T28 Invariant violated on {len(balance_errors)} daily balance rows: {balance_errors[:3]}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T28 Exception: {ex}")
+        failed += 1
+
+    # T32: Same seed generated twice yields identical data hash
+    try:
+        import app.seed
+        expected_hash = "95f67c90a7e1aac079359935da8afb71f49f4208c4a0b46935105d0df2d72eae"
+        # Seed fresh and calculate hash
+        app.seed.seed_database(42)
+        h1 = app.seed.get_database_hash()
+        app.seed.seed_database(42)
+        h2 = app.seed.get_database_hash()
+        if h1 == h2 and h1 == expected_hash:
+            print(f"PASS: T32 Deterministic seed verification (hash {h1[:12]}... matches across consecutive seeds)")
+            passed += 1
+        else:
+            print(f"FAIL: T32 Seed hash mismatch: h1={h1}, h2={h2}, expected={expected_hash}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T32 Exception: {ex}")
         failed += 1
 
     cursor.close()
@@ -752,6 +897,10 @@ def main():
     p_ana, f_ana = run_analytics_tests()
     total_passed += p_ana
     total_failed += f_ana
+
+    p_qual, f_qual = run_quality_tests()
+    total_passed += p_qual
+    total_failed += f_qual
 
     print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
     if total_failed > 0:
