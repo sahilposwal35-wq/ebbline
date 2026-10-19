@@ -326,4 +326,176 @@ BEGIN
     JOIN scenario sb ON sb.scenario_id = p_scenario_b;
 END//
 
+-- Procedure: explain_day
+-- Purpose: Returns all events up to a given day, largest outflows first, with running total and category breakdown.
+-- Acceptance criteria: sum of listed events plus anchor balance equals stored day balance (AC1).
+DROP PROCEDURE IF EXISTS explain_day//
+CREATE PROCEDURE explain_day(
+    IN p_run_id INT,
+    IN p_day DATE
+)
+BEGIN
+    DECLARE v_anchor_balance DECIMAL(12,2);
+    DECLARE v_anchor_date DATE;
+    DECLARE v_stored_balance DECIMAL(12,2);
+
+    SELECT anchor_balance, anchor_date INTO v_anchor_balance, v_anchor_date
+    FROM projection_run WHERE run_id = p_run_id;
+
+    SELECT balance INTO v_stored_balance
+    FROM projection_day WHERE run_id = p_run_id AND day = p_day;
+
+    -- Result Set 1: Day summary
+    SELECT 
+        p_run_id AS run_id,
+        p_day AS query_day,
+        v_anchor_date AS anchor_date,
+        v_anchor_balance AS anchor_balance,
+        v_stored_balance AS stored_day_balance;
+
+    -- Result Set 2: Events up to query day with running contribution
+    SELECT 
+        pe.event_id,
+        pe.due_date,
+        pe.source_type,
+        pe.source_id,
+        pe.label,
+        c.name AS category_name,
+        c.is_essential,
+        pe.amount,
+        v_anchor_balance + SUM(pe.amount) OVER (
+            ORDER BY pe.due_date, pe.amount ASC, pe.event_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_balance
+    FROM projection_event pe
+    JOIN category c ON c.category_id = pe.category_id
+    WHERE pe.run_id = p_run_id AND pe.due_date <= p_day
+    ORDER BY pe.due_date, pe.amount ASC, pe.event_id;
+
+    -- Result Set 3: Category breakdown up to query day
+    SELECT 
+        c.category_id,
+        c.name AS category_name,
+        c.is_essential,
+        COUNT(*) AS event_count,
+        SUM(pe.amount) AS total_amount
+    FROM projection_event pe
+    JOIN category c ON c.category_id = pe.category_id
+    WHERE pe.run_id = p_run_id AND pe.due_date <= p_day
+    GROUP BY c.category_id, c.name, c.is_essential
+    ORDER BY total_amount ASC;
+END//
+
+-- Procedure: suggest_fixes
+-- Purpose: Identifies fewest discretionary outflows before the first breach that cover the shortfall.
+-- Scope note: Addresses the first breach only.
+DROP PROCEDURE IF EXISTS suggest_fixes//
+CREATE PROCEDURE suggest_fixes(
+    IN p_run_id INT
+)
+BEGIN
+    DECLARE v_account_id INT;
+    DECLARE v_buffer_min DECIMAL(12,2);
+    DECLARE v_min_balance DECIMAL(12,2);
+    DECLARE v_first_breach DATE;
+    DECLARE v_shortfall DECIMAL(12,2);
+
+    SELECT pr.account_id, a.buffer_min, pr.min_balance, pr.first_breach_date
+    INTO v_account_id, v_buffer_min, v_min_balance, v_first_breach
+    FROM projection_run pr
+    JOIN account a ON a.account_id = pr.account_id
+    WHERE pr.run_id = p_run_id;
+
+    IF v_first_breach IS NULL THEN
+        SELECT 
+            'No breach detected in this run; no fixes required.' AS message,
+            0.00 AS shortfall_target;
+    ELSE
+        SET v_shortfall = v_buffer_min - v_min_balance;
+
+        WITH cand AS (
+            SELECT 
+                pe.event_id,
+                pe.source_type,
+                pe.source_id,
+                pe.due_date,
+                pe.label,
+                c.name AS category_name,
+                -pe.amount AS saving
+            FROM projection_event pe
+            JOIN category c ON c.category_id = pe.category_id
+            WHERE pe.run_id = p_run_id
+              AND c.is_essential = FALSE
+              AND pe.amount < 0
+              AND pe.due_date <= v_first_breach
+        ),
+        ranked AS (
+            SELECT 
+                cand.*,
+                SUM(saving) OVER (
+                    ORDER BY saving DESC, due_date, event_id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS cum_saving
+            FROM cand
+        )
+        SELECT 
+            event_id,
+            source_type,
+            source_id,
+            due_date,
+            label,
+            category_name,
+            saving,
+            cum_saving,
+            v_shortfall AS shortfall_target,
+            'Addresses the first breach only' AS scope_note
+        FROM ranked
+        WHERE cum_saving - saving < v_shortfall
+        ORDER BY saving DESC, due_date;
+    END IF;
+END//
+
+-- Procedure: backtest
+-- Purpose: Evaluates past forecast error against actual recorded checkpoints.
+DROP PROCEDURE IF EXISTS backtest//
+CREATE PROCEDURE backtest(
+    IN p_account_id INT
+)
+BEGIN
+    DECLARE v_chk_count INT;
+
+    SELECT COUNT(*) INTO v_chk_count
+    FROM balance_checkpoint
+    WHERE account_id = p_account_id;
+
+    IF v_chk_count < 2 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'At least two balance checkpoints are required for backtesting',
+                MYSQL_ERRNO = 45001;
+    END IF;
+
+    SELECT 
+        bc.checkpoint_id,
+        bc.account_id,
+        bc.as_of_date AS checkpoint_date,
+        bc.balance AS actual_balance,
+        pr.run_id AS projected_run_id,
+        pr.anchor_date AS projection_anchor_date,
+        pd.balance AS projected_balance,
+        (pd.balance - bc.balance) AS error_amount,
+        ABS(pd.balance - bc.balance) AS absolute_error,
+        CASE 
+            WHEN bc.balance <> 0 THEN ROUND((ABS(pd.balance - bc.balance) / ABS(bc.balance)) * 100.0, 2)
+            ELSE 0.00 
+        END AS percent_error
+    FROM balance_checkpoint bc
+    JOIN projection_day pd ON pd.day = bc.as_of_date
+    JOIN projection_run pr ON pr.run_id = pd.run_id 
+                         AND pr.account_id = bc.account_id 
+                         AND pr.anchor_date < bc.as_of_date
+                         AND pr.scenario_id = 1
+    WHERE bc.account_id = p_account_id
+    ORDER BY bc.as_of_date ASC, pr.run_id DESC;
+END//
+
 DELIMITER ;

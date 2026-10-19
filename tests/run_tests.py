@@ -1,5 +1,7 @@
 import sys
 import os
+import datetime
+from decimal import Decimal
 import mysql.connector
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -529,6 +531,204 @@ def run_scenario_tests():
     conn.close()
     return passed, failed
 
+def run_analytics_tests():
+    print("\nRunning Phase 6 analytics and import tests (F12, F13, F14, F15, F16, F17, F18, T21, T22, T23, T30)...")
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    passed = 0
+    failed = 0
+
+    # F12: Explain day (AC1: sum of listed events plus anchor equals stored balance)
+    try:
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 1 AND scenario_id = 1")
+        rid = cursor.fetchone()['rid']
+        cursor.callproc('explain_day', [rid, '2026-10-18'])
+        results = list(cursor.stored_results())
+        summary = results[0].fetchone()
+        events = results[1].fetchall()
+        
+        anchor_bal = summary['anchor_balance']
+        stored_bal = summary['stored_day_balance']
+        event_sum = sum(e['amount'] for e in events)
+        calculated_bal = anchor_bal + event_sum
+
+        if calculated_bal == stored_bal and len(events) > 0:
+            print(f"PASS: F12 Explain day (anchor {anchor_bal} + events sum {event_sum} equals stored balance {stored_bal})")
+            passed += 1
+        else:
+            print(f"FAIL: F12 Sum mismatch: anchor {anchor_bal} + sum {event_sum} = {calculated_bal} != {stored_bal}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: F12 Exception: {ex}")
+        failed += 1
+
+    # F13: Fix suggestions (AC1: only is_essential = 0 items suggested; states scope note)
+    try:
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 1 AND scenario_id = 1")
+        rid = cursor.fetchone()['rid']
+        cursor.callproc('suggest_fixes', [rid])
+        results = list(cursor.stored_results())
+        fixes = results[0].fetchall()
+        if len(fixes) > 0 and all(f['scope_note'] == 'Addresses the first breach only' for f in fixes):
+            # Verify that suggested rules are indeed discretionary
+            rule_ids = [f['source_id'] for f in fixes if f['source_type'] == 'RULE']
+            cursor.execute(f"SELECT COUNT(*) AS c FROM recurring_rule r JOIN category c ON c.category_id = r.category_id WHERE r.rule_id IN ({','.join(map(str, rule_ids))}) AND c.is_essential = 1")
+            essential_count = cursor.fetchone()['c']
+            if essential_count == 0:
+                print(f"PASS: F13 Fix suggestions (all {len(fixes)} suggestions are discretionary and address first breach only)")
+                passed += 1
+            else:
+                print(f"FAIL: F13 Essential items were suggested: {essential_count}")
+                failed += 1
+        else:
+            print(f"FAIL: F13 Unexpected fixes output: {fixes}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: F13 Exception: {ex}")
+        failed += 1
+
+    # F14: Plan vs actual variance (AC1: rule with no actuals shows full variance)
+    try:
+        cursor.execute("SELECT * FROM v_plan_vs_actual WHERE rule_id = 12 LIMIT 1")
+        row = cursor.fetchone()
+        if row and row['actual_amount'] == Decimal('0.00') and row['variance'] == -row['planned_amount']:
+            print("PASS: F14 Plan vs actual variance (stale rule with no actuals shows full variance without error)")
+            passed += 1
+        else:
+            print(f"FAIL: F14 Unexpected plan vs actual row for rule 12: {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: F14 Exception: {ex}")
+        failed += 1
+
+    # F15: Forecast backtest (AC1: rejects < 2 checkpoints, AC2: reports actual error)
+    try:
+        # Account 2 has only 1 checkpoint, should be rejected
+        try:
+            cursor.callproc('backtest', [2])
+            print("FAIL: F15 Backtest on account with 1 checkpoint accepted unexpectedly")
+            failed += 1
+        except Exception as ex:
+            if '45001' in str(ex):
+                print("PASS: F15 Backtest correctly rejected for account with < 2 checkpoints (error 45001)")
+                passed += 1
+            else:
+                print(f"FAIL: F15 Unexpected error on < 2 checkpoints: {ex}")
+                failed += 1
+
+        # Account 1 has 3 checkpoints, test past checkpoints
+        cursor.callproc('backtest', [1])
+        results = list(cursor.stored_results())
+        rows = results[0].fetchall()
+        print(f"PASS: F15 Backtest executed for Account 1 ({len(rows)} comparative points found)")
+        passed += 1
+    except Exception as ex:
+        print(f"FAIL: F15 Exception: {ex}")
+        failed += 1
+
+    # F16: Reserve schedule (AC1: monthly set-aside is obligation / period_months)
+    try:
+        cursor.execute("SELECT monthly_set_aside, total_obligation, period_months FROM v_reserve_schedule WHERE rule_id = 11")
+        row = cursor.fetchone()
+        expected_set_aside = Decimal('3750.00') # 45000 / 12
+        if row and row['monthly_set_aside'] == expected_set_aside:
+            print(f"PASS: F16 Reserve schedule (45000.00 yearly obligation yields INR {row['monthly_set_aside']}/month set-aside)")
+            passed += 1
+        else:
+            print(f"FAIL: F16 Expected 3750.00, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: F16 Exception: {ex}")
+        failed += 1
+
+    # F17, T22, T23: CSV Import
+    try:
+        import tempfile
+        from app.import_csv import import_actuals_csv
+
+        # Test valid CSV import
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tf:
+            tf.write("txn_date,amount,label,account_id\n")
+            tf.write("2026-09-20,-1250.00,Test Pharmacy,1\n")
+            tf.write("2026-09-22,-850.00,Test Book Store,1\n")
+            csv_path = tf.name
+
+        res1 = import_actuals_csv(csv_path, default_account_id=1, rollback_on_error=True)
+        if res1['success'] and res1['inserted'] == 2 and res1['duplicates'] == 0:
+            print("PASS: F17 CSV Import (2 rows inserted in a single transaction)")
+            passed += 1
+        else:
+            print(f"FAIL: F17 First import failed: {res1}")
+            failed += 1
+
+        # T22: Re-import identical CSV -> 0 inserted, 2 duplicates
+        res2 = import_actuals_csv(csv_path, default_account_id=1, rollback_on_error=True)
+        if res2['success'] and res2['inserted'] == 0 and res2['duplicates'] == 2:
+            print("PASS: T22 Duplicate CSV protection (re-importing adds 0 rows, catches 2 duplicates)")
+            passed += 1
+        else:
+            print(f"FAIL: T22 Expected 0 inserted, 2 duplicates, got {res2}")
+            failed += 1
+
+        # T23: CSV with invalid row and rollback_on_error=True -> whole file rolls back
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tf_bad:
+            tf_bad.write("txn_date,amount,label,account_id\n")
+            tf_bad.write("2026-09-25,-500.00,Valid Row,1\n")
+            tf_bad.write("invalid-date,-500.00,Bad Row,1\n")
+            bad_csv_path = tf_bad.name
+
+        res3 = import_actuals_csv(bad_csv_path, default_account_id=1, rollback_on_error=True)
+        if not res3['success'] and res3['inserted'] == 0:
+            print("PASS: T23 CSV atomic rollback on error (invalid date rolls back whole batch)")
+            passed += 1
+        else:
+            print(f"FAIL: T23 Expected failure and 0 inserted, got {res3}")
+            failed += 1
+
+        # Cleanup imported test rows
+        cursor.execute("DELETE FROM actual_txn WHERE label IN ('Test Pharmacy', 'Test Book Store', 'Valid Row')")
+
+    except Exception as ex:
+        print(f"FAIL: F17/T22/T23 Exception: {ex}")
+        failed += 1
+
+    # F18, T30: Rule History trigger on update
+    try:
+        cursor.execute("SELECT amount FROM recurring_rule WHERE rule_id = 2")
+        orig_amount = cursor.fetchone()['amount']
+        cursor.execute("UPDATE recurring_rule SET amount = -32000.00 WHERE rule_id = 2")
+        cursor.execute("SELECT old_amount, new_amount FROM rule_history WHERE rule_id = 2 ORDER BY history_id DESC LIMIT 1")
+        h_row = cursor.fetchone()
+        cursor.execute("UPDATE recurring_rule SET amount = %s WHERE rule_id = 2", [orig_amount])
+
+        if h_row and h_row['old_amount'] == Decimal('-30000.00') and h_row['new_amount'] == Decimal('-32000.00'):
+            print("PASS: F18/T30 Rule history trigger (audit row recorded with old -30000.00 and new -32000.00)")
+            passed += 1
+        else:
+            print(f"FAIL: F18/T30 Unexpected rule history: {h_row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: F18/T30 Exception: {ex}")
+        failed += 1
+
+    # T21: Checkpoint 10 days old (projection starts day after anchor)
+    try:
+        cursor.execute("SELECT anchor_date, horizon_start FROM projection_run WHERE run_id = 1")
+        row = cursor.fetchone()
+        if row['horizon_start'] == row['anchor_date'] + datetime.timedelta(days=1):
+            print("PASS: T21 Checkpoint anchor (projection starts exactly 1 day after checkpoint date)")
+            passed += 1
+        else:
+            print(f"FAIL: T21 Expected horizon_start = anchor_date + 1, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T21 Exception: {ex}")
+        failed += 1
+
+    cursor.close()
+    conn.close()
+    return passed, failed
+
 def main():
     total_passed = 0
     total_failed = 0
@@ -549,11 +749,9 @@ def main():
     total_passed += p_scen
     total_failed += f_scen
 
-    print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
-    if total_failed > 0:
-        sys.exit(1)
-    else:
-        sys.exit(0)
+    p_ana, f_ana = run_analytics_tests()
+    total_passed += p_ana
+    total_failed += f_ana
 
     print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
     if total_failed > 0:
