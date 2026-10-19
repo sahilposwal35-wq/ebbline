@@ -96,6 +96,102 @@ def run_constraint_tests():
     conn.close()
     return passed, failed
 
+def run_expansion_tests():
+    print("\nRunning Phase 3 expansion tests (T1 to T6)...")
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    passed = 0
+    failed = 0
+
+    # T1: Monthly rule starting 31 Jan (Rule 9)
+    cursor.execute("""
+        SELECT due_date FROM v_rule_occurrence 
+        WHERE source_id = 9 AND due_date BETWEEN '2026-01-01' AND '2026-04-01' 
+        ORDER BY due_date
+    """)
+    rows = cursor.fetchall()
+    dates = [r['due_date'].strftime('%Y-%m-%d') for r in rows]
+    if dates == ['2026-01-31', '2026-02-28', '2026-03-31']:
+        print("PASS: T1 Monthly rule starting 31 Jan (Feb 28 clamp, Mar 31 no drift)")
+        passed += 1
+    else:
+        print(f"FAIL: T1 Expected ['2026-01-31', '2026-02-28', '2026-03-31'] but got {dates}")
+        failed += 1
+
+    # T2: Leap-year 29 Feb start (Rule 10)
+    cursor.execute("""
+        SELECT due_date FROM v_rule_occurrence 
+        WHERE source_id = 10 AND due_date BETWEEN '2024-01-01' AND '2028-12-31' 
+        ORDER BY due_date
+    """)
+    rows = cursor.fetchall()
+    dates = [r['due_date'].strftime('%Y-%m-%d') for r in rows]
+    if dates == ['2024-02-29', '2025-02-28', '2026-02-28', '2027-02-28', '2028-02-29']:
+        print("PASS: T2 Leap-year 29 Feb start (clamps to 28 Feb in non-leap, 29 Feb in leap year)")
+        passed += 1
+    else:
+        print(f"FAIL: T2 Expected 2024/2028 leap clamp but got {dates}")
+        failed += 1
+
+    # T3: Weekly rule, every 2 weeks (Rule 6)
+    cursor.execute("""
+        SELECT due_date, DATEDIFF(due_date, LAG(due_date) OVER (ORDER BY due_date)) AS diff_days
+        FROM v_rule_occurrence 
+        WHERE source_id = 6 AND due_date BETWEEN '2026-10-01' AND '2026-12-31' 
+        ORDER BY due_date
+    """)
+    rows = cursor.fetchall()
+    diffs = [r['diff_days'] for r in rows[1:]]
+    if len(diffs) > 0 and all(d == 14 for d in diffs):
+        print(f"PASS: T3 Weekly rule every 2 weeks (14-day spacing across {len(diffs)} periods)")
+        passed += 1
+    else:
+        print(f"FAIL: T3 Expected all diffs to be 14 days, got {diffs}")
+        failed += 1
+
+    # T4: Yearly rule via every_n = 12 (Rule 11)
+    cursor.execute("""
+        SELECT COUNT(*) AS occ_count FROM v_rule_occurrence 
+        WHERE source_id = 11 AND due_date BETWEEN '2026-10-01' AND '2027-10-01'
+    """)
+    cnt = cursor.fetchone()['occ_count']
+    if cnt == 1:
+        print("PASS: T4 Yearly rule via every_n = 12 (exactly 1 occurrence per year)")
+        passed += 1
+    else:
+        print(f"FAIL: T4 Expected 1 occurrence per year, got {cnt}")
+        failed += 1
+
+    # T5: Rule ends before horizon (Rule 15)
+    cursor.execute("""
+        SELECT COUNT(*) AS occ_after_end FROM v_rule_occurrence 
+        WHERE source_id = 15 AND due_date > '2026-05-01'
+    """)
+    cnt = cursor.fetchone()['occ_after_end']
+    if cnt == 0:
+        print("PASS: T5 Rule ends before horizon (0 occurrences after end date)")
+        passed += 1
+    else:
+        print(f"FAIL: T5 Expected 0 occurrences after end date, got {cnt}")
+        failed += 1
+
+    # T6: Rule starts after horizon
+    cursor.execute("""
+        SELECT COUNT(*) AS occ_future_start FROM v_rule_occurrence 
+        WHERE start_date > '2028-12-31' AND due_date <= '2027-12-31'
+    """)
+    cnt = cursor.fetchone()['occ_future_start']
+    if cnt == 0:
+        print("PASS: T6 Rule starts after horizon (0 occurrences)")
+        passed += 1
+    else:
+        print(f"FAIL: T6 Expected 0 occurrences, got {cnt}")
+        failed += 1
+
+    cursor.close()
+    conn.close()
+    return passed, failed
+
 def main():
     total_passed = 0
     total_failed = 0
@@ -103,6 +199,10 @@ def main():
     p, f = run_constraint_tests()
     total_passed += p
     total_failed += f
+
+    p_exp, f_exp = run_expansion_tests()
+    total_passed += p_exp
+    total_failed += f_exp
 
     print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
     if total_failed > 0:
