@@ -41,3 +41,10 @@ The project initiation document outlined markdown files in some sections, wherea
 
 Decision D14: MySQL 8.4 LTS runtime.
 MySQL 8.4 LTS is utilized, satisfying the requirement for MySQL 8.0 or later.
+
+Decision D15: MySQL port and service architecture.
+The user reported that the system MySQL service on port 3306 is resolved. Because an isolated, least-privilege MySQL 8.4 instance was already initialized and fully functional on port 3307 with all database objects and passing tests, the project maintains port 3307 as its configured default in .env. Connection parameters remain fully environment configurable to allow pointing to port 3306 or external hosts without code modifications.
+
+Decision D16: Index selection verified by measurement.
+Candidate indexes identified in the Project Initiation Document were tested with EXPLAIN ANALYZE before and after creation. All seven candidate indexes improved or preserved optimal execution paths across rules, events, scenario overrides, actual transactions, and projection run lookups, and were committed in sql/04_indexes.sql with measurements documented in docs/benchmarks.txt.
+
