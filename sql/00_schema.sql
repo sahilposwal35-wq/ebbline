@@ -98,7 +98,7 @@ CREATE TABLE scenario_change (
     CONSTRAINT ck_change_target CHECK ((rule_id IS NULL) <> (event_id IS NULL)),
     CONSTRAINT ck_change_range CHECK (to_date >= from_date),
     CONSTRAINT ck_change_value CHECK (action = 'SKIP' OR value IS NOT NULL),
-    CONSTRAINT fk_change_scenario FOREIGN KEY (scenario_id) REFERENCES scenario(scenario_id),
+    CONSTRAINT fk_change_scenario FOREIGN KEY (scenario_id) REFERENCES scenario(scenario_id) ON DELETE CASCADE,
     CONSTRAINT fk_change_rule FOREIGN KEY (rule_id) REFERENCES recurring_rule(rule_id),
     CONSTRAINT fk_change_event FOREIGN KEY (event_id) REFERENCES one_off_event(event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -133,8 +133,8 @@ CREATE TABLE projection_run (
     days_below_buffer INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT ck_run_horizon CHECK (horizon_end > horizon_start),
-    CONSTRAINT fk_run_scenario FOREIGN KEY (scenario_id) REFERENCES scenario(scenario_id),
-    CONSTRAINT fk_run_account FOREIGN KEY (account_id) REFERENCES account(account_id)
+    CONSTRAINT fk_run_scenario FOREIGN KEY (scenario_id) REFERENCES scenario(scenario_id) ON DELETE CASCADE,
+    CONSTRAINT fk_run_account FOREIGN KEY (account_id) REFERENCES account(account_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 10. Projection day table

@@ -228,4 +228,102 @@ proc_block: BEGIN
     COMMIT;
 END//
 
+-- Procedure: add_scenario_change
+-- Purpose: Adds a scenario override row with parent-row locking to avoid trigger race conditions (Decision D7).
+DROP PROCEDURE IF EXISTS add_scenario_change//
+CREATE PROCEDURE add_scenario_change(
+    IN p_scenario_id INT,
+    IN p_rule_id INT,
+    IN p_event_id INT,
+    IN p_action VARCHAR(20),
+    IN p_value DECIMAL(10,2),
+    IN p_from_date DATE,
+    IN p_to_date DATE,
+    OUT p_change_id INT
+)
+BEGIN
+    DECLARE v_parent_id INT;
+
+    START TRANSACTION;
+
+    -- Lock parent scenario row to serialize concurrent inserts for this scenario
+    SELECT scenario_id INTO v_parent_id
+    FROM scenario
+    WHERE scenario_id = p_scenario_id
+    FOR UPDATE;
+
+    IF v_parent_id IS NULL THEN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Scenario does not exist',
+                MYSQL_ERRNO = 45006;
+    END IF;
+
+    INSERT INTO scenario_change (
+        scenario_id, rule_id, event_id, action, value, from_date, to_date
+    ) VALUES (
+        p_scenario_id, p_rule_id, p_event_id, p_action, p_value, p_from_date, p_to_date
+    );
+    SET p_change_id = LAST_INSERT_ID();
+
+    COMMIT;
+END//
+
+-- Procedure: compare_scenarios
+-- Purpose: Compares two scenarios for an account, returning the difference in minimum balance, breach date, and days below buffer.
+-- If no run exists for either scenario, it builds a default 365-day run first.
+DROP PROCEDURE IF EXISTS compare_scenarios//
+CREATE PROCEDURE compare_scenarios(
+    IN p_scenario_a INT,
+    IN p_scenario_b INT,
+    IN p_account_id INT
+)
+BEGIN
+    DECLARE v_run_a INT;
+    DECLARE v_run_b INT;
+
+    -- Ensure run A exists
+    SELECT MAX(run_id) INTO v_run_a
+    FROM projection_run
+    WHERE account_id = p_account_id AND scenario_id = p_scenario_a;
+
+    IF v_run_a IS NULL THEN
+        CALL build_projection(p_scenario_a, p_account_id, 365, v_run_a);
+    END IF;
+
+    -- Ensure run B exists
+    SELECT MAX(run_id) INTO v_run_b
+    FROM projection_run
+    WHERE account_id = p_account_id AND scenario_id = p_scenario_b;
+
+    IF v_run_b IS NULL THEN
+        CALL build_projection(p_scenario_b, p_account_id, 365, v_run_b);
+    END IF;
+
+    -- Return comparison row
+    SELECT 
+        p_account_id AS account_id,
+        acc.name AS account_name,
+        sa.scenario_id AS scenario_a_id,
+        sa.name AS scenario_a_name,
+        ra.run_id AS run_a_id,
+        ra.min_balance AS min_balance_a,
+        ra.first_breach_date AS first_breach_a,
+        ra.days_below_buffer AS days_below_a,
+        sb.scenario_id AS scenario_b_id,
+        sb.name AS scenario_b_name,
+        rb.run_id AS run_b_id,
+        rb.min_balance AS min_balance_b,
+        rb.first_breach_date AS first_breach_b,
+        rb.days_below_buffer AS days_below_b,
+        (rb.min_balance - ra.min_balance) AS min_balance_delta,
+        DATEDIFF(rb.first_breach_date, ra.first_breach_date) AS breach_shift_days,
+        (rb.days_below_buffer - ra.days_below_buffer) AS days_below_delta
+    FROM projection_run ra
+    JOIN projection_run rb ON ra.run_id = v_run_a AND rb.run_id = v_run_b
+    JOIN account acc ON acc.account_id = p_account_id
+    JOIN scenario sa ON sa.scenario_id = p_scenario_a
+    JOIN scenario sb ON sb.scenario_id = p_scenario_b;
+END//
+
 DELIMITER ;

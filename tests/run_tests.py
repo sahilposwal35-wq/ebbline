@@ -36,19 +36,19 @@ def run_constraint_tests():
          True),
         ("C7: Change with both targets null rejected",
          "INSERT INTO scenario_change (scenario_id, rule_id, event_id, action, value, from_date, to_date) "
-         "VALUES (1, NULL, NULL, 'SKIP', NULL, '2026-01-01', '2026-01-31')",
+         "VALUES (2, NULL, NULL, 'SKIP', NULL, '2026-01-01', '2026-01-31')",
          True),
         ("C8: Change with both targets set rejected",
          "INSERT INTO scenario_change (scenario_id, rule_id, event_id, action, value, from_date, to_date) "
-         "VALUES (1, 1, 1, 'SKIP', NULL, '2026-01-01', '2026-01-31')",
+         "VALUES (2, 1, 1, 'SKIP', NULL, '2026-01-01', '2026-01-31')",
          True),
         ("C9: Change to_date before from_date rejected",
          "INSERT INTO scenario_change (scenario_id, rule_id, event_id, action, value, from_date, to_date) "
-         "VALUES (1, 1, NULL, 'SKIP', NULL, '2026-05-01', '2026-04-01')",
+         "VALUES (2, 1, NULL, 'SKIP', NULL, '2026-05-01', '2026-04-01')",
          True),
         ("C10: Change SCALE with null value rejected",
          "INSERT INTO scenario_change (scenario_id, rule_id, event_id, action, value, from_date, to_date) "
-         "VALUES (1, 1, NULL, 'SCALE', NULL, '2026-05-01', '2026-05-31')",
+         "VALUES (2, 1, NULL, 'SCALE', NULL, '2026-05-01', '2026-05-31')",
          True),
         ("C11: Future checkpoint rejected by add_checkpoint",
          "CALL add_checkpoint(1, '2099-01-01', 10000.00)",
@@ -342,6 +342,193 @@ def run_projection_tests():
     conn.close()
     return passed, failed
 
+from decimal import Decimal
+
+def run_scenario_tests():
+    print("\nRunning Phase 5 scenario and trigger tests (T7, T8, T9, T10, T17, T18, T19, T20, T31)...")
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    passed = 0
+    failed = 0
+
+    # T7: SKIP boundaries (from_date and to_date inclusive)
+    try:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 907")
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (907, 'T7 Scenario', 'Boundary test')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, from_date, to_date) VALUES (907, 6, 'SKIP', '2026-10-03', '2026-10-31')")
+        cursor.callproc('build_projection', [907, 1, 60, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 907")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT COUNT(*) AS c FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 6 AND due_date BETWEEN '2026-10-03' AND '2026-10-31'", [rid])
+        cnt = cursor.fetchone()['c']
+        if cnt == 0:
+            print("PASS: T7 SKIP boundary test (occurrences on from_date and to_date correctly skipped)")
+            passed += 1
+        else:
+            print(f"FAIL: T7 Expected 0 occurrences, got {cnt}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T7 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 907")
+
+    # T8: SHIFT across month end
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (908, 'T8 Shift', 'Month end shift')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, value, from_date, to_date) VALUES (908, 9, 'SHIFT_DAYS', 5.00, '2026-10-01', '2026-10-31')")
+        cursor.callproc('build_projection', [908, 1, 60, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 908")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT due_date FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 9 AND due_date BETWEEN '2026-11-01' AND '2026-11-10'", [rid])
+        row = cursor.fetchone()
+        if row and str(row['due_date']) == '2026-11-05':
+            print("PASS: T8 SHIFT across month end (Oct 31 + 5 days moved to 2026-11-05)")
+            passed += 1
+        else:
+            print(f"FAIL: T8 Expected 2026-11-05, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T8 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 908")
+
+    # T9: SCALE by 0
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (909, 'T9 Scale 0', 'Scale by 0')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, value, from_date, to_date) VALUES (909, 2, 'SCALE', 0.00, '2026-10-01', '2026-10-31')")
+        cursor.callproc('build_projection', [909, 1, 60, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 909")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT amount FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 2 AND due_date = '2026-10-05'", [rid])
+        row = cursor.fetchone()
+        if row and row['amount'] == 0:
+            print("PASS: T9 SCALE by 0 (scaled amount equals 0.00)")
+            passed += 1
+        else:
+            print(f"FAIL: T9 Expected 0.00, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T9 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 909")
+
+    # T10: Overlapping changes rejected with error 45005
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (910, 'T10 Overlap', 'Trigger test')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, from_date, to_date) VALUES (910, 1, 'SKIP', '2026-10-01', '2026-10-15')")
+        try:
+            cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, from_date, to_date) VALUES (910, 1, 'SKIP', '2026-10-15', '2026-10-31')")
+            print("FAIL: T10 Touching ranges accepted unexpectedly")
+            failed += 1
+        except Exception as ex:
+            if '45005' in str(ex):
+                print("PASS: T10 Overlapping scenario changes rejected by trigger with error 45005")
+                passed += 1
+            else:
+                print(f"FAIL: T10 Unexpected error message: {ex}")
+                failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 910")
+
+    # T17: Weekly rule SHIFT crossing year end
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (917, 'T17 Year End', 'Shift into next year')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, value, from_date, to_date) VALUES (917, 6, 'SHIFT_DAYS', 7.00, '2026-12-20', '2026-12-31')")
+        cursor.callproc('build_projection', [917, 1, 120, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 917")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT due_date FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 6 AND due_date = '2027-01-02'", [rid])
+        row = cursor.fetchone()
+        if row and str(row['due_date']) == '2027-01-02':
+            print("PASS: T17 Weekly rule SHIFT crossing 31 Dec (moved to 2027-01-02)")
+            passed += 1
+        else:
+            print(f"FAIL: T17 Expected 2027-01-02, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T17 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 917")
+
+    # T18: SKIP range covering exactly one occurrence
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (918, 'T18 Single Skip', 'Skip single occurrence')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, from_date, to_date) VALUES (918, 6, 'SKIP', '2026-10-10', '2026-10-20')")
+        cursor.callproc('build_projection', [918, 1, 60, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 918")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT due_date FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 6 AND due_date BETWEEN '2026-10-01' AND '2026-10-31' ORDER BY due_date", [rid])
+        dates = [str(r['due_date']) for r in cursor.fetchall()]
+        if dates == ['2026-10-03', '2026-10-31']:
+            print("PASS: T18 SKIP range covering exactly one occurrence (only Oct 17 removed)")
+            passed += 1
+        else:
+            print(f"FAIL: T18 Expected ['2026-10-03', '2026-10-31'], got {dates}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T18 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 918")
+
+    # T19: SCALE 1.5 on outflow
+    try:
+        cursor.execute("INSERT INTO scenario (scenario_id, name, description) VALUES (919, 'T19 Scale Outflow', 'Scale outflow by 1.5')")
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, value, from_date, to_date) VALUES (919, 2, 'SCALE', 1.50, '2026-10-01', '2026-10-31')")
+        cursor.callproc('build_projection', [919, 1, 60, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE scenario_id = 919")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT amount FROM projection_event WHERE run_id = %s AND source_type = 'RULE' AND source_id = 2 AND due_date = '2026-10-05'", [rid])
+        row = cursor.fetchone()
+        if row and row['amount'] == Decimal('-45000.00'):
+            print("PASS: T19 SCALE 1.5 on outflow (-30000.00 scaled to -45000.00)")
+            passed += 1
+        else:
+            print(f"FAIL: T19 Expected -45000.00, got {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T19 Exception: {ex}")
+        failed += 1
+    finally:
+        cursor.execute("DELETE FROM scenario WHERE scenario_id = 919")
+
+    # T20: Change on Baseline rejected with 45006
+    try:
+        cursor.execute("INSERT INTO scenario_change (scenario_id, rule_id, action, from_date, to_date) VALUES (1, 1, 'SKIP', '2026-10-01', '2026-10-31')")
+        print("FAIL: T20 Change on Baseline accepted unexpectedly")
+        failed += 1
+    except Exception as ex:
+        if '45006' in str(ex):
+            print("PASS: T20 Insert change on Baseline rejected with error 45006")
+            passed += 1
+        else:
+            print(f"FAIL: T20 Unexpected error message: {ex}")
+            failed += 1
+
+    # T31: Compare Baseline with itself
+    try:
+        cursor.callproc('compare_scenarios', [1, 1, 1])
+        # Read procedure result set
+        for result in cursor.stored_results():
+            row = result.fetchone()
+            if row and row['min_balance_delta'] == Decimal('0.00') and row['breach_shift_days'] == 0 and row['days_below_delta'] == 0:
+                print("PASS: T31 Compare Baseline with itself yields zero deltas")
+                passed += 1
+            else:
+                print(f"FAIL: T31 Expected zero deltas, got {row}")
+                failed += 1
+    except Exception as ex:
+        print(f"FAIL: T31 Exception: {ex}")
+        failed += 1
+
+    cursor.close()
+    conn.close()
+    return passed, failed
+
 def main():
     total_passed = 0
     total_failed = 0
@@ -357,6 +544,16 @@ def main():
     p_proj, f_proj = run_projection_tests()
     total_passed += p_proj
     total_failed += f_proj
+
+    p_scen, f_scen = run_scenario_tests()
+    total_passed += p_scen
+    total_failed += f_scen
+
+    print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
+    if total_failed > 0:
+        sys.exit(1)
+    else:
+        sys.exit(0)
 
     print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
     if total_failed > 0:
