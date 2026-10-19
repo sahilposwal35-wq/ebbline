@@ -30,4 +30,202 @@ BEGIN
     ON DUPLICATE KEY UPDATE balance = VALUES(balance);
 END//
 
+-- Procedure: build_projection
+-- Purpose: Generates a complete daily balance projection for an account and scenario over a specified horizon.
+-- Runs in a single atomic transaction. Rolls back completely on any error.
+DROP PROCEDURE IF EXISTS build_projection//
+CREATE PROCEDURE build_projection(
+    IN p_scenario_id INT,
+    IN p_account_id INT,
+    IN p_horizon_days INT,
+    OUT p_run_id INT
+)
+proc_block: BEGIN
+    DECLARE v_anchor_date DATE;
+    DECLARE v_anchor_balance DECIMAL(12,2);
+    DECLARE v_start_date DATE;
+    DECLARE v_end_date DATE;
+    DECLARE v_buffer_min DECIMAL(12,2);
+    DECLARE v_min_balance DECIMAL(12,2);
+    DECLARE v_min_balance_date DATE;
+    DECLARE v_first_breach_date DATE;
+    DECLARE v_days_below_buffer INT;
+
+    -- Exit handler for transaction rollback
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        DROP TEMPORARY TABLE IF EXISTS tmp_occ;
+        DROP TEMPORARY TABLE IF EXISTS tmp_net;
+        RESIGNAL;
+    END;
+
+    -- Step 1: Input Validation
+    IF NOT EXISTS (SELECT 1 FROM account WHERE account_id = p_account_id AND is_active = TRUE) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Account is inactive or does not exist',
+                MYSQL_ERRNO = 45002;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM scenario WHERE scenario_id = p_scenario_id) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Scenario does not exist',
+                MYSQL_ERRNO = 45006;
+    END IF;
+
+    IF p_horizon_days < 1 OR p_horizon_days > 730 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Horizon must be between 1 and 730 days',
+                MYSQL_ERRNO = 45003;
+    END IF;
+
+    -- Step 2: Start Transaction
+    START TRANSACTION;
+
+    -- Step 3: Find anchor checkpoint (latest checkpoint on or before CURDATE)
+    SELECT as_of_date, balance
+    INTO v_anchor_date, v_anchor_balance
+    FROM balance_checkpoint
+    WHERE account_id = p_account_id AND as_of_date <= CURDATE()
+    ORDER BY as_of_date DESC
+    LIMIT 1;
+
+    IF v_anchor_date IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'No valid checkpoint found for this account on or before today',
+                MYSQL_ERRNO = 45001;
+    END IF;
+
+    -- Projection starts the day after the anchor checkpoint (Decision D8)
+    SET v_start_date = DATE_ADD(v_anchor_date, INTERVAL 1 DAY);
+    SET v_end_date = DATE_ADD(v_start_date, INTERVAL (p_horizon_days - 1) DAY);
+
+    -- Step 4: Expand occurrences into temporary table
+    DROP TEMPORARY TABLE IF EXISTS tmp_occ;
+    CREATE TEMPORARY TABLE tmp_occ (
+        temp_id INT AUTO_INCREMENT PRIMARY KEY,
+        source_type ENUM('RULE', 'EVENT') NOT NULL,
+        source_id INT NOT NULL,
+        account_id INT NOT NULL,
+        category_id INT NOT NULL,
+        label VARCHAR(80) NOT NULL,
+        amount DECIMAL(12,2) NOT NULL,
+        due_date DATE NOT NULL
+    );
+
+    INSERT INTO tmp_occ (source_type, source_id, account_id, category_id, label, amount, due_date)
+    SELECT source_type, source_id, account_id, category_id, label, amount, due_date
+    FROM v_rule_occurrence
+    WHERE account_id = p_account_id
+      AND due_date BETWEEN DATE_SUB(v_start_date, INTERVAL 90 DAY) AND DATE_ADD(v_end_date, INTERVAL 90 DAY)
+    UNION ALL
+    SELECT 'EVENT', event_id, account_id, category_id, label, amount, event_date
+    FROM one_off_event
+    WHERE account_id = p_account_id
+      AND event_date BETWEEN DATE_SUB(v_start_date, INTERVAL 90 DAY) AND DATE_ADD(v_end_date, INTERVAL 90 DAY);
+
+    -- Step 5: Apply scenario changes if not baseline (Order: SKIP, then SHIFT_DAYS, then SCALE)
+    IF p_scenario_id <> 1 THEN
+        -- 5a. SKIP
+        DELETE o FROM tmp_occ o
+        JOIN scenario_change sc ON sc.scenario_id = p_scenario_id AND sc.action = 'SKIP'
+          AND ((o.source_type = 'RULE' AND o.source_id = sc.rule_id) OR (o.source_type = 'EVENT' AND o.source_id = sc.event_id))
+          AND o.due_date BETWEEN sc.from_date AND sc.to_date;
+
+        -- 5b. SHIFT_DAYS
+        UPDATE tmp_occ o
+        JOIN scenario_change sc ON sc.scenario_id = p_scenario_id AND sc.action = 'SHIFT_DAYS'
+          AND ((o.source_type = 'RULE' AND o.source_id = sc.rule_id) OR (o.source_type = 'EVENT' AND o.source_id = sc.event_id))
+          AND o.due_date BETWEEN sc.from_date AND sc.to_date
+        SET o.due_date = DATE_ADD(o.due_date, INTERVAL CAST(sc.value AS SIGNED) DAY);
+
+        -- 5c. SCALE (Round to 2 decimals once - Decision D9)
+        UPDATE tmp_occ o
+        JOIN scenario_change sc ON sc.scenario_id = p_scenario_id AND sc.action = 'SCALE'
+          AND ((o.source_type = 'RULE' AND o.source_id = sc.rule_id) OR (o.source_type = 'EVENT' AND o.source_id = sc.event_id))
+          AND o.due_date BETWEEN sc.from_date AND sc.to_date
+        SET o.amount = ROUND(o.amount * sc.value, 2);
+    END IF;
+
+    -- Retain only occurrences within the projection horizon
+    DELETE FROM tmp_occ WHERE due_date < v_start_date OR due_date > v_end_date;
+
+    -- Step 6: Aggregate daily net into tmp_net
+    DROP TEMPORARY TABLE IF EXISTS tmp_net;
+    CREATE TEMPORARY TABLE tmp_net (
+        day DATE NOT NULL PRIMARY KEY,
+        net DECIMAL(12,2) NOT NULL
+    );
+
+    INSERT INTO tmp_net (day, net)
+    SELECT cd.day, COALESCE(SUM(o.amount), 0.00) AS net
+    FROM calendar_day cd
+    LEFT JOIN tmp_occ o ON o.due_date = cd.day
+    WHERE cd.day BETWEEN v_start_date AND v_end_date
+    GROUP BY cd.day;
+
+    -- Step 7: Insert projection_run header
+    INSERT INTO projection_run (
+        scenario_id, account_id, horizon_start, horizon_end,
+        anchor_date, anchor_balance, min_balance, min_balance_date,
+        first_breach_date, days_below_buffer
+    ) VALUES (
+        p_scenario_id, p_account_id, v_start_date, v_end_date,
+        v_anchor_date, v_anchor_balance, NULL, NULL, NULL, 0
+    );
+    SET p_run_id = LAST_INSERT_ID();
+
+    -- Step 8: Insert projection_event rows
+    INSERT INTO projection_event (
+        run_id, due_date, source_type, source_id, label, category_id, amount
+    )
+    SELECT 
+        p_run_id, due_date, source_type, source_id, label, category_id, amount
+    FROM tmp_occ
+    ORDER BY due_date, source_type, source_id;
+
+    -- Step 9: Insert projection_day with running balance
+    INSERT INTO projection_day (run_id, day, net, balance)
+    SELECT 
+        p_run_id,
+        tn.day,
+        tn.net,
+        v_anchor_balance + SUM(tn.net) OVER (
+            ORDER BY tn.day 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS balance
+    FROM tmp_net tn
+    ORDER BY tn.day;
+
+    -- Step 10: Update header with lowest balance, first breach date, and days below buffer
+    SELECT buffer_min INTO v_buffer_min FROM account WHERE account_id = p_account_id;
+
+    SELECT 
+        MIN(balance),
+        MIN(CASE WHEN balance < v_buffer_min THEN day END),
+        SUM(CASE WHEN balance < v_buffer_min THEN 1 ELSE 0 END)
+    INTO v_min_balance, v_first_breach_date, v_days_below_buffer
+    FROM projection_day
+    WHERE run_id = p_run_id;
+
+    SELECT day INTO v_min_balance_date
+    FROM projection_day
+    WHERE run_id = p_run_id AND balance = v_min_balance
+    ORDER BY day ASC
+    LIMIT 1;
+
+    UPDATE projection_run
+    SET min_balance = v_min_balance,
+        min_balance_date = v_min_balance_date,
+        first_breach_date = v_first_breach_date,
+        days_below_buffer = v_days_below_buffer
+    WHERE run_id = p_run_id;
+
+    -- Step 11: Cleanup temporary tables and commit
+    DROP TEMPORARY TABLE IF EXISTS tmp_occ;
+    DROP TEMPORARY TABLE IF EXISTS tmp_net;
+
+    COMMIT;
+END//
+
 DELIMITER ;

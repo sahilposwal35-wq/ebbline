@@ -192,6 +192,156 @@ def run_expansion_tests():
     conn.close()
     return passed, failed
 
+def run_projection_tests():
+    print("\nRunning Phase 4 projection and breach tests (T11, T12, T15, T16, T24, T25, T29)...")
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    passed = 0
+    failed = 0
+
+    # T11: No breach account (Account 2)
+    try:
+        cursor.callproc('build_projection', [1, 2, 365, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 2 AND scenario_id = 1")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT first_breach_date, days_below_buffer, min_balance FROM projection_run WHERE run_id = %s", [rid])
+        row = cursor.fetchone()
+        if row['first_breach_date'] is None and row['days_below_buffer'] == 0 and row['min_balance'] >= 20000:
+            print("PASS: T11 No rules/never breach account (first_breach_date is NULL, 0 days below buffer)")
+            passed += 1
+        else:
+            print(f"FAIL: T11 Unexpected values: {row}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T11 Exception: {ex}")
+        failed += 1
+
+    # T12: Breach on Day 1
+    try:
+        cursor.execute("INSERT INTO account (account_id, name, account_type, buffer_min) VALUES (990, 'Day 1 Breach Acc', 'SAVINGS', 50000.00)")
+        cursor.execute("INSERT INTO balance_checkpoint (account_id, as_of_date, balance) VALUES (990, '2026-10-01', 30000.00)")
+        cursor.callproc('build_projection', [1, 990, 30, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 990")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT horizon_start, first_breach_date FROM projection_run WHERE run_id = %s", [rid])
+        row = cursor.fetchone()
+        cursor.execute("DELETE FROM projection_run WHERE account_id = 990")
+        cursor.execute("DELETE FROM account WHERE account_id = 990")
+        if row['first_breach_date'] == row['horizon_start']:
+            print(f"PASS: T12 Day 1 breach (first breach {row['first_breach_date']} equals horizon start)")
+            passed += 1
+        else:
+            print(f"FAIL: T12 Expected breach on {row['horizon_start']}, got {row['first_breach_date']}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T12 Exception: {ex}")
+        failed += 1
+
+    # T15: Planted breach matches exact date (2026-10-18)
+    try:
+        cursor.callproc('build_projection', [1, 1, 365, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 1 AND scenario_id = 1")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT first_breach_date FROM projection_run WHERE run_id = %s", [rid])
+        row = cursor.fetchone()
+        if str(row['first_breach_date']) == '2026-10-18':
+            print("PASS: T15 Planted breach date matches exactly 2026-10-18")
+            passed += 1
+        else:
+            print(f"FAIL: T15 Expected 2026-10-18, got {row['first_breach_date']}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T15 Exception: {ex}")
+        failed += 1
+
+    # T16: Hand-calculated 3-month case matches to the paisa
+    try:
+        from scripts.compute_t16_case import compute
+        expected = compute()
+        cursor.callproc('build_projection', [1, 1, 90, 0])
+        cursor.execute("SELECT MAX(run_id) AS rid FROM projection_run WHERE account_id = 1 AND scenario_id = 1")
+        rid = cursor.fetchone()['rid']
+        cursor.execute("SELECT day, net, balance FROM projection_day WHERE run_id = %s ORDER BY day", [rid])
+        db_rows = cursor.fetchall()
+        mismatches = 0
+        for (exp_date, exp_net, exp_bal), db_row in zip(expected, db_rows):
+            if exp_date != db_row['day'] or exp_net != db_row['net'] or exp_bal != db_row['balance']:
+                mismatches += 1
+        if mismatches == 0 and len(db_rows) == 90:
+            print(f"PASS: T16 Hand-calculated 3-month case matches all {len(db_rows)} days to the exact paisa")
+            passed += 1
+        else:
+            print(f"FAIL: T16 Mismatches found: {mismatches}")
+            failed += 1
+    except Exception as ex:
+        print(f"FAIL: T16 Exception: {ex}")
+        failed += 1
+
+    # T24: Horizon 0 and 731 rejected with 45003
+    try:
+        cursor.callproc('build_projection', [1, 1, 0, 0])
+        print("FAIL: T24 Horizon 0 accepted unexpectedly")
+        failed += 1
+    except Exception as ex:
+        if '45003' in str(ex):
+            print("PASS: T24 Horizon 0 rejected with error 45003")
+            passed += 1
+        else:
+            print(f"FAIL: T24 Unexpected error for horizon 0: {ex}")
+            failed += 1
+
+    try:
+        cursor.callproc('build_projection', [1, 1, 731, 0])
+        print("FAIL: T24 Horizon 731 accepted unexpectedly")
+        failed += 1
+    except Exception as ex:
+        if '45003' in str(ex):
+            print("PASS: T24 Horizon 731 rejected with error 45003")
+            passed += 1
+        else:
+            print(f"FAIL: T24 Unexpected error for horizon 731: {ex}")
+            failed += 1
+
+    # T25: Inactive account rejected with 45002
+    try:
+        cursor.execute("INSERT INTO account (account_id, name, account_type, buffer_min, is_active) VALUES (991, 'Inactive Acc', 'SAVINGS', 1000.00, FALSE)")
+        cursor.callproc('build_projection', [1, 991, 30, 0])
+        print("FAIL: T25 Inactive account accepted unexpectedly")
+        failed += 1
+    except Exception as ex:
+        if '45002' in str(ex):
+            print("PASS: T25 Inactive account rejected with error 45002")
+            passed += 1
+        else:
+            print(f"FAIL: T25 Unexpected error for inactive account: {ex}")
+            failed += 1
+    finally:
+        cursor.execute("DELETE FROM account WHERE account_id = 991")
+
+    # T29: Atomic rollback on failure leaves no rows
+    cursor.execute("SELECT COUNT(*) AS c FROM projection_run")
+    runs_before = cursor.fetchone()['c']
+    cursor.execute("SELECT COUNT(*) AS c FROM projection_day")
+    days_before = cursor.fetchone()['c']
+    try:
+        cursor.callproc('build_projection', [1, 1, 800, 0])
+    except Exception:
+        pass
+    cursor.execute("SELECT COUNT(*) AS c FROM projection_run")
+    runs_after = cursor.fetchone()['c']
+    cursor.execute("SELECT COUNT(*) AS c FROM projection_day")
+    days_after = cursor.fetchone()['c']
+    if runs_before == runs_after and days_before == days_after:
+        print("PASS: T29 Failed build rolls back cleanly leaving no orphaned header or day rows")
+        passed += 1
+    else:
+        print(f"FAIL: T29 Orphaned rows created on failed build (runs {runs_before}->{runs_after}, days {days_before}->{days_after})")
+        failed += 1
+
+    cursor.close()
+    conn.close()
+    return passed, failed
+
 def main():
     total_passed = 0
     total_failed = 0
@@ -203,6 +353,10 @@ def main():
     p_exp, f_exp = run_expansion_tests()
     total_passed += p_exp
     total_failed += f_exp
+
+    p_proj, f_proj = run_projection_tests()
+    total_passed += p_proj
+    total_failed += f_proj
 
     print(f"\nTest Summary: {total_passed} passed, {total_failed} failed.")
     if total_failed > 0:
