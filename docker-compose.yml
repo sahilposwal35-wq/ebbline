@@ -1,0 +1,16 @@
+services:
+  db:
+    image: mysql:8.4
+    container_name: ebbline_db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: ebbline
+      MYSQL_USER: ebbline
+      MYSQL_PASSWORD: ebbline_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - ebbline_data:/var/lib/mysql
+
+volumes:
+  ebbline_data:

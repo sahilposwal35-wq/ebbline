@@ -1,0 +1,62 @@
+Market Comparison Matrix
+
+Date of review: 20 Oct 2026.
+Note: All app entries below are marked as not yet verified per the project protocol, as first hand trial verification is pending.
+
+App name: Walnut (India)
+Daily balance forecast: Not yet verified
+Breach date alert: Not yet verified
+What if scenarios: Not yet verified
+Explanation of cause: Not yet verified
+Fix suggestion: Not yet verified
+Input method: SMS parsing and manual entry (not yet verified)
+Permissions needed: SMS and storage permissions (not yet verified)
+Pricing: Free with ads or paid tier (not yet verified)
+
+App name: INDmoney (India)
+Daily balance forecast: Not yet verified
+Breach date alert: Not yet verified
+What if scenarios: Not yet verified
+Explanation of cause: Not yet verified
+Fix suggestion: Not yet verified
+Input method: Account aggregator, email statement parsing and manual entry (not yet verified)
+Permissions needed: Financial account access and identity permissions (not yet verified)
+Pricing: Freemium with investment commissions (not yet verified)
+
+App name: Monefy (Global)
+Daily balance forecast: Not yet verified
+Breach date alert: Not yet verified
+What if scenarios: Not yet verified
+Explanation of cause: Not yet verified
+Fix suggestion: Not yet verified
+Input method: Manual entry (not yet verified)
+Permissions needed: None for basic use (not yet verified)
+Pricing: Free tier and paid Pro tier (not yet verified)
+
+App name: PocketGuard (Global)
+Daily balance forecast: Not yet verified
+Breach date alert: Not yet verified
+What if scenarios: Not yet verified
+Explanation of cause: Not yet verified
+Fix suggestion: Not yet verified
+Input method: Bank sync and manual entry (not yet verified)
+Permissions needed: Bank account read access (not yet verified)
+Pricing: Paid subscription with limited free trial (not yet verified)
+
+App name: YNAB You Need A Budget (Global)
+Daily balance forecast: Not yet verified
+Breach date alert: Not yet verified
+What if scenarios: Not yet verified
+Explanation of cause: Not yet verified
+Fix suggestion: Not yet verified
+Input method: Bank sync, file import and manual entry (not yet verified)
+Permissions needed: Bank account connection or file access (not yet verified)
+Pricing: Paid annual or monthly subscription (not yet verified)
+
+Summary of Ebbline comparison:
+Ebbline focuses specifically on user controlled forward looking cash flow runway forecasting using SQL. It evaluates dated recurring obligations and one off events to calculate day by day balances, detect buffer breaches, explain the driving events, and test what if changes without modifying the baseline plan. Ebbline does not claim to be the first or only personal finance tool, but offers this distinct combination of features with zero required bank permissions.
+
+Name Search Record (Phase 0 Check):
+Search performed on 20 Oct 2026 across web search and app stores.
+Result: The name Ebbline is associated with an independent software entity publishing niche tracking apps such as Divhive. Ebbline as implemented here is a personal portfolio project focusing on a relational database cash flow forecasting engine in MySQL, clearly labelled as a personal project with synthetic data.
+

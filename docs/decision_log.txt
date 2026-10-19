@@ -1,0 +1,43 @@
+Ebbline Decision Log
+
+Decision D1: Money format.
+Money is stored as DECIMAL(12,2) and never as floating point types. This ensures exact arithmetic without binary floating point representation errors.
+
+Decision D2: Recurrence definition.
+Recurrence is defined with a unit of WEEK or MONTH and an every_n positive integer. Quarterly is represented as MONTH with every_n of 3, and yearly is represented as MONTH with every_n of 12.
+
+Decision D3: Occurrence computation anchor.
+Monthly occurrence dates are always computed directly from the start date as start date plus k times every_n months, rather than from the previous occurrence. This prevents month end dates such as 31 January from drifting to 28 February and staying at 28 March.
+
+Decision D4: Append only runs.
+Projection runs are strictly append only. Each build creates a new run with its header and daily balance rows. This prevents overwrite races and provides historical forecast runs for backtesting.
+
+Decision D5: Calendar day table.
+A calendar_day table populated with three years of consecutive dates is used to ensure all days appear in projections and to avoid recursion depth limits in running series queries.
+
+Decision D6: Explicit window frame.
+Running sum window functions use an explicit ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW frame. This prevents ties on identical values from grouping unexpectedly under the default RANGE frame.
+
+Decision D7: Scenario change overlap protection.
+Overlap protection is enforced by a trigger on BEFORE INSERT and BEFORE UPDATE on scenario_change. In procedures that insert scenario changes, the parent scenario row is locked with SELECT FOR UPDATE to prevent concurrency races.
+
+Decision D8: Projection horizon start.
+The projection starts the day after the anchor checkpoint date so that obligations and events occurring between the checkpoint date and today are not omitted.
+
+Decision D9: Scale rounding rule.
+Scaled amounts are multiplied and then rounded to two decimal places once.
+
+Decision D10: Scenario action order.
+Scenario changes are applied in the deterministic order of SKIP first, then SHIFT_DAYS, then SCALE.
+
+Decision D11: Storing projection events.
+Every expanded occurrence used in a projection run is saved to projection_event. This enables explain day and fix suggestions to query stored rows directly and guarantees full auditability.
+
+Decision D12: Thin application layer.
+All business logic, constraints, running balance calculations, breach detections, and suggestions reside exclusively in SQL tables, views, triggers, and stored procedures. Python and Streamlit only invoke database procedures and present output.
+
+Decision D13: Plain text documentation and README format.
+The project initiation document outlined markdown files in some sections, whereas the master prompt required all human readable documents including the readme to be plain text without markdown, tables, bullets, or symbols. Following the single source of truth resolution rule, plain text without markdown is adopted for all human readable files, and the main documentation file is named README.txt.
+
+Decision D14: MySQL 8.4 LTS runtime.
+MySQL 8.4 LTS is utilized, satisfying the requirement for MySQL 8.0 or later.
