@@ -48,3 +48,7 @@ The user reported that the system MySQL service on port 3306 is resolved. Becaus
 Decision D16: Index selection verified by measurement.
 Candidate indexes identified in the Project Initiation Document were tested with EXPLAIN ANALYZE before and after creation. All seven candidate indexes improved or preserved optimal execution paths across rules, events, scenario overrides, actual transactions, and projection run lookups, and were committed in sql/04_indexes.sql with measurements documented in docs/benchmarks.txt.
 
+Decision D17: FastAPI and React TypeScript full-stack modernization.
+The project architecture was modernized to add a Python FastAPI backend and a React TypeScript Single Page Application frontend. The core calculation engine, schema, constraints, views, stored procedures, triggers, and indexes in MySQL 8 remain untouched as the single source of truth. FastAPI serves as an asynchronous, typed REST API layer directly invoking database stored procedures and views. React and TypeScript deliver an interactive interface with Recharts visualization, real-time feedback, and granular component updates without full-page reloads.
+
+

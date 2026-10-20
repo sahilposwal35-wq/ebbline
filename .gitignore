@@ -16,6 +16,11 @@ venv/
 env/
 .ebbline_venv/
 
+# Node.js and Frontend dependencies
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
 # Testing cache
 .pytest_cache/
 .coverage

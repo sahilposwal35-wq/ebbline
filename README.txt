@@ -1,12 +1,13 @@
 Ebbline Cash Flow Forecasting Engine
 
 1. Overview
-Ebbline is a forward looking cash flow forecasting engine for personal finance built on MySQL 8 and Python with Streamlit. The application models recurring obligations such as rent, loan instalments, investments, insurance premiums and subscriptions alongside one time events. The database expands recurring patterns across time horizons up to 730 days, projects daily account balances with explicit running window functions, flags the exact day an account dips below its safety buffer, explains the driving transactions behind any dip, and suggests actionable discretionary adjustments across what if scenarios. All business logic, constraints, running balance arithmetic, triggers, and analytical procedures live strictly in MySQL. Python and Streamlit serve only as a thin presentation and orchestration layer.
+Ebbline is a forward looking cash flow forecasting engine for personal finance built on MySQL 8. The application models recurring obligations such as rent, loan instalments, investments, insurance premiums and subscriptions alongside one time events. The database expands recurring patterns across time horizons up to 730 days, projects daily account balances with explicit running window functions, flags the exact day an account dips below its safety buffer, explains the driving transactions behind any dip, and suggests actionable discretionary adjustments across what if scenarios. All business logic, constraints, running balance arithmetic, triggers, and analytical procedures live strictly in MySQL. A high-performance Python FastAPI backend exposes typed REST endpoints to a modern React TypeScript Single Page Application and a lightweight Streamlit interface.
 
 2. Technology Stack and Requirements
 Database: MySQL 8.0 or later (verified on MySQL 8.4 LTS).
-Runtime: Python 3.11 or later.
-Dependencies: mysql-connector-python, streamlit, altair, pandas.
+Backend: Python 3.11 or later with FastAPI, Uvicorn, and mysql-connector-python.
+Frontend: React 18 with TypeScript, Vite, and Recharts.
+Alternative UI: Streamlit with Altair.
 Operating System: Linux, macOS, or Windows.
 
 3. Quickstart and Setup Instructions
@@ -41,10 +42,17 @@ Step 5. Run the automated test suite.
 Execute all 51 tests across constraints, expansions, projections, scenarios, analytics, and invariants:
 python tests/run_tests.py
 
-Step 6. Launch the web interface.
-Start the Streamlit application:
+Step 6. Launch the FastAPI backend and React TypeScript web interface.
+Start the FastAPI server:
+uvicorn app.api:app --host 127.0.0.1 --port 8080
+Open your web browser at http://localhost:8080 to access the full React and TypeScript single page application with Recharts shoreline visualizations.
+For frontend development with hot module reloading, navigate to the frontend folder and run:
+npm run dev
+This launches the development server at http://localhost:5173 with API proxying to port 8080.
+
+Alternatively, you can run the original Streamlit application:
 streamlit run app/ui.py
-Open your web browser at http://localhost:8501 to access the five screens.
+Open http://localhost:8501 to view the Streamlit interface.
 
 4. Data Model and Relational Architecture
 The database schema consists of thirteen tables designed in third normal form with strict referential constraints:
